@@ -158,6 +158,16 @@ dmg_refresh_mode_is_pinned() {
     esac
 }
 
+run_asar_cli() {
+    if [ -n "${CODEX_ASAR_CLI:-}" ]; then
+        [ -x "$CODEX_ASAR_CLI" ] || error "CODEX_ASAR_CLI is not executable: $CODEX_ASAR_CLI"
+        "$CODEX_ASAR_CLI" "$@"
+        return
+    fi
+
+    npx --yes asar "$@"
+}
+
 prepare_install() {
     if [ "$FRESH_INSTALL" -eq 1 ] && [ -d "$INSTALL_DIR" ]; then
         info "Removing existing install directory: $INSTALL_DIR"
