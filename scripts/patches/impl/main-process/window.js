@@ -2,7 +2,7 @@
 
 const {
   escapeRegExp,
-} = require("../shared.js");
+} = require("../../lib/minified-js.js");
 
 const LINUX_TITLEBAR_OVERLAY_HEIGHT = 30;
 const LINUX_TITLEBAR_OVERLAY_HELPER = "codexLinuxTitleBarOverlay";
@@ -371,6 +371,13 @@ function applyLinuxMenuPatch(currentSource) {
   return patchedSource;
 }
 
+function applyLinuxApplicationMenuPatch(currentSource) {
+  return currentSource.replace(
+    /([A-Za-z_$][\w$]*)\.Menu\.setApplicationMenu\(process\.platform===`linux`\?null:([A-Za-z_$][\w$]*)\)/g,
+    (_match, electronAlias, menuAlias) => `${electronAlias}.Menu.setApplicationMenu(${menuAlias})`,
+  );
+}
+
 function applyLinuxSetIconPatch(currentSource, iconAsset) {
   if (iconAsset == null) {
     return currentSource;
@@ -687,6 +694,7 @@ process.platform===\`linux\`?Promise.resolve((()=>{let __codexLinuxAboutIcon=$5.
 
 module.exports = {
   applyLinuxAboutDialogPatch,
+  applyLinuxApplicationMenuPatch,
   applyLinuxMenuPatch,
   applyLinuxNativeTitlebarPatch,
   applyLinuxOpaqueBackgroundPatch,

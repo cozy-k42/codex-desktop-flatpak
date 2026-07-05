@@ -380,9 +380,13 @@ SCRIPT
     assert_file_exists "$pkg_root/opt/codex-desktop/update-builder/scripts/lib/linux-features.js"
     assert_file_exists "$pkg_root/opt/codex-desktop/update-builder/scripts/lib/linux-features.sh"
     assert_file_exists "$pkg_root/opt/codex-desktop/update-builder/scripts/lib/linux-target-context.js"
+    assert_file_exists "$pkg_root/opt/codex-desktop/update-builder/scripts/patches/descriptor.js"
     assert_file_exists "$pkg_root/opt/codex-desktop/update-builder/scripts/patches/engine.js"
-    assert_file_exists "$pkg_root/opt/codex-desktop/update-builder/scripts/patches/registry.js"
-    assert_file_exists "$pkg_root/opt/codex-desktop/update-builder/scripts/patches/shared.js"
+    assert_file_exists "$pkg_root/opt/codex-desktop/update-builder/scripts/patches/runner.js"
+    assert_file_exists "$pkg_root/opt/codex-desktop/update-builder/scripts/patches/lib/assets.js"
+    assert_file_exists "$pkg_root/opt/codex-desktop/update-builder/scripts/patches/lib/minified-js.js"
+    assert_file_exists "$pkg_root/opt/codex-desktop/update-builder/scripts/patches/lib/settings-keys.js"
+    assert_file_exists "$pkg_root/opt/codex-desktop/update-builder/scripts/patches/impl/webview/index.js"
     assert_file_exists "$pkg_root/opt/codex-desktop/update-builder/scripts/patches/core/all-linux/main-process/lifecycle/patch.js"
     assert_file_exists "$pkg_root/opt/codex-desktop/update-builder/scripts/patches/core/all-linux/webview/theme-and-sunset/patch.js"
     assert_file_exists "$pkg_root/opt/codex-desktop/update-builder/scripts/patches/core/distro/nixos/README.md"
@@ -472,6 +476,7 @@ test_update_builder_preserves_enabled_linux_features_config() {
     local staged_config="$root/opt/codex-desktop/update-builder/linux-features/features.json"
     local staged_local_manifest="$root/opt/codex-desktop/update-builder/linux-features/local/local-tool/feature.json"
     local source_info="$root/opt/codex-desktop/update-builder/.codex-linux/source-info.json"
+    local update_builder_manifest="$root/opt/codex-desktop/update-builder/.codex-linux/update-builder-manifest.txt"
 
     mkdir -p "$workspace"
     make_fake_app "$app_dir"
@@ -523,12 +528,16 @@ JSON
 
     assert_file_exists "$staged_config"
     assert_file_exists "$staged_local_manifest"
+    assert_file_exists "$update_builder_manifest"
     assert_contains "$staged_config" "example-feature"
     assert_contains "$staged_config" "local-tool"
     assert_contains "$staged_config" "tweaks"
     assert_contains "$staged_config" "mode"
     assert_not_contains "$staged_config" "localComment"
     assert_not_contains "$staged_config" "disabled-feature"
+    assert_contains "$update_builder_manifest" "record-replay-linux/Cargo.toml"
+    assert_contains "$update_builder_manifest" "assets/codex-linux.png"
+    assert_not_contains "$update_builder_manifest" "^node-runtime/"
 
     node - "$staged_config" <<'NODE' || fail "Expected staged Linux features config to be sanitized"
 const fs = require("node:fs");
@@ -1437,6 +1446,50 @@ EOF
     [ "$(cat "$differing/Codex.dmg")" = "new" ] || fail "Expected differing metadata to refresh cache"
     assert_contains "$differing/curl.log" "GET"
 
+    local differing_pinned="$workspace/differing-pinned"
+    mkdir -p "$differing_pinned"
+    printf '%s' "old" >"$differing_pinned/Codex.dmg"
+    cat >"$differing_pinned/Codex.dmg.metadata" <<EOF
+url_sha256=$url_sha256
+etag=old-etag
+last_modified=Thu, 04 Jun 2026 00:00:00 GMT
+content_length=3
+EOF
+    run_dmg_cache_case "$differing_pinned" "$differing_pinned/output.log" \
+        CODEX_DMG_REFRESH_MODE=pinned \
+        TEST_ETAG=fresh-etag \
+        TEST_LAST_MODIFIED="Thu, 04 Jun 2026 00:00:00 GMT" \
+        TEST_CONTENT_LENGTH=3 \
+        TEST_DOWNLOAD_CONTENT=new
+    [ "$(cat "$differing_pinned/Codex.dmg")" = "old" ] || fail "Expected pinned stale cache to keep old DMG"
+    assert_not_contains "$differing_pinned/curl.log" "HEAD"
+    assert_not_contains "$differing_pinned/curl.log" "GET"
+    assert_contains "$differing_pinned/output.log" "CODEX_DMG_REFRESH_MODE=pinned"
+
+    local no_metadata_pinned="$workspace/no-metadata-pinned"
+    mkdir -p "$no_metadata_pinned"
+    printf '%s' "old" >"$no_metadata_pinned/Codex.dmg"
+    run_dmg_cache_case "$no_metadata_pinned" "$no_metadata_pinned/output.log" \
+        CODEX_DMG_REFRESH_MODE=pinned \
+        TEST_ETAG=fresh-etag \
+        TEST_LAST_MODIFIED="Thu, 04 Jun 2026 00:00:00 GMT" \
+        TEST_CONTENT_LENGTH=3 \
+        TEST_DOWNLOAD_CONTENT=new
+    [ "$(cat "$no_metadata_pinned/Codex.dmg")" = "old" ] || fail "Expected pinned missing metadata cache to keep old DMG"
+    assert_not_contains "$no_metadata_pinned/curl.log" "HEAD"
+    assert_not_contains "$no_metadata_pinned/curl.log" "GET"
+
+    local missing_pinned="$workspace/missing-pinned"
+    mkdir -p "$missing_pinned"
+    if run_dmg_cache_case "$missing_pinned" "$missing_pinned/output.log" \
+        CODEX_DMG_REFRESH_MODE=pinned
+    then
+        fail "Expected pinned mode without cached DMG to fail"
+    fi
+    assert_not_contains "$missing_pinned/curl.log" "HEAD"
+    assert_not_contains "$missing_pinned/curl.log" "GET"
+    assert_contains "$missing_pinned/output.log" "requires an existing cached DMG"
+
     local failed_get="$workspace/failed-get"
     mkdir -p "$failed_get"
     printf '%s' "old" >"$failed_get/Codex.dmg"
@@ -1678,6 +1731,34 @@ SCRIPT
     assert_file_not_exists "$source_dir/Codex.dmg.metadata"
 }
 
+test_fresh_pinned_dmg_preserves_cached_dmg_metadata() {
+    info "Checking --fresh preserves cached DMG metadata in pinned refresh mode"
+    local workspace="$TMP_DIR/fresh-pinned-dmg-metadata"
+    local source_dir="$workspace/source"
+
+    mkdir -p "$source_dir"
+    printf '%s' "cached" >"$source_dir/Codex.dmg"
+    printf '%s' "metadata" >"$source_dir/Codex.dmg.metadata"
+
+    TEST_SOURCE_DIR="$source_dir" REPO_DIR="$REPO_DIR" bash <<'SCRIPT'
+set -Eeuo pipefail
+
+SCRIPT_DIR="$TEST_SOURCE_DIR"
+WORK_DIR="$(mktemp -d)"
+INSTALL_DIR="$TEST_SOURCE_DIR/codex-app"
+CODEX_DMG_REFRESH_MODE=pinned
+# shellcheck disable=SC1091
+source "$REPO_DIR/scripts/lib/install-helpers.sh"
+
+FRESH_INSTALL=1
+REUSE_CACHED_DMG=0
+prepare_install
+SCRIPT
+
+    assert_file_exists "$source_dir/Codex.dmg"
+    assert_file_exists "$source_dir/Codex.dmg.metadata"
+}
+
 test_fresh_reuse_dmg_uses_cache_when_metadata_matches() {
     info "Checking --fresh --reuse-dmg reuses cached DMG when metadata matches"
     local workspace="$TMP_DIR/fresh-reuse-dmg-metadata"
@@ -1861,6 +1942,153 @@ test_fedora_dependency_bootstrap_installs_rpmbuild() {
     assert_contains "$helper" "sudo dnf install nodejs npm python3 p7zip p7zip-plugins curl unzip rpm-build make gcc-c++"
     assert_contains "$readme" "sudo dnf install python3 7zip curl unzip rpm-build make gcc-c++ @development-tools"
     assert_contains "$readme" "sudo dnf install python3 p7zip p7zip-plugins curl unzip rpm-build make gcc-c++"
+}
+
+test_fedora_atomic_rpm_ostree_target_detection() {
+    info "Checking Fedora Atomic rpm-ostree target detection"
+    local workspace="$TMP_DIR/fedora-atomic-target"
+    local fake_bin="$workspace/bin"
+    local os_release="$workspace/os-release"
+    local ostree_booted="$workspace/ostree-booted"
+    local install_log="$workspace/install-deps.log"
+    local wizard_log="$workspace/bootstrap-wizard.log"
+    local helper_output="$workspace/helper-output.log"
+
+    mkdir -p "$fake_bin"
+    printf '%s\n' '#!/bin/sh' 'exit 0' > "$fake_bin/rpm-ostree"
+    printf '%s\n' '#!/bin/sh' 'exit 0' > "$fake_bin/rpmbuild"
+    chmod +x "$fake_bin/rpm-ostree" "$fake_bin/rpmbuild"
+    cat > "$os_release" <<'EOF'
+ID=fedora
+ID_LIKE=
+VERSION_ID="44"
+PRETTY_NAME="Fedora Linux 44 (KDE Plasma Desktop Edition)"
+VARIANT_ID=kde
+EOF
+    : > "$ostree_booted"
+
+    PATH="$fake_bin:/usr/bin:/bin" \
+    OS_RELEASE_FILE="$os_release" \
+    OSTREE_BOOTED_FILE="$ostree_booted" \
+    DETECT_ONLY=1 \
+        bash "$REPO_DIR/scripts/install-deps.sh" >"$install_log"
+    assert_contains "$install_log" "Detected dependency profile: rpm-ostree"
+    assert_contains "$install_log" "ID=fedora"
+    assert_not_contains "$install_log" "ID_LIKE=ubuntu"
+
+    local missing_bin="$workspace/missing-bin"
+    local missing_log="$workspace/install-deps-missing.log"
+    mkdir -p "$missing_bin"
+    for command in dirname pwd uname; do
+        ln -s "$(command -v "$command")" "$missing_bin/$command"
+    done
+    printf '%s\n' '#!/bin/sh' 'exit 0' > "$missing_bin/rpm-ostree"
+    chmod +x "$missing_bin/rpm-ostree"
+
+    local status=0
+    PATH="$missing_bin" \
+    OS_RELEASE_FILE="$os_release" \
+    OSTREE_BOOTED_FILE="$ostree_booted" \
+    HOME="$workspace/home-missing" \
+        /bin/bash "$REPO_DIR/scripts/install-deps.sh" >"$missing_log" 2>&1 || status=$?
+    [ "$status" -ne 0 ] || fail "Expected rpm-ostree install-deps to stop before packages are layered"
+    assert_contains "$missing_log" "sudo rpm-ostree install python3 7zip curl unzip rpm-build make gcc-c++"
+    assert_contains "$missing_log" "Still missing:"
+    assert_not_contains "$missing_log" "nodejs npm"
+
+    local layered_bin="$workspace/layered-bin"
+    local layered_log="$workspace/install-deps-layered.log"
+    mkdir -p "$layered_bin"
+    for command in dirname pwd uname grep; do
+        ln -s "$(command -v "$command")" "$layered_bin/$command"
+    done
+    for command in rpm-ostree python3 7zz curl unzip rpmbuild make g++ cargo; do
+        cat > "$layered_bin/$command" <<'SCRIPT'
+#!/bin/sh
+command_name="${0##*/}"
+case "$command_name" in
+    7zz) echo "7-Zip 26.00" ;;
+    cargo) echo "cargo 1.96.0" ;;
+    *) exit 0 ;;
+esac
+SCRIPT
+        chmod +x "$layered_bin/$command"
+    done
+
+    PATH="$layered_bin" \
+    OS_RELEASE_FILE="$os_release" \
+    OSTREE_BOOTED_FILE="$ostree_booted" \
+    HOME="$workspace/home-layered" \
+        /bin/bash "$REPO_DIR/scripts/install-deps.sh" >"$layered_log" 2>&1
+    assert_contains "$layered_log" "rpm-ostree layered build dependencies are already available"
+    assert_contains "$layered_log" "Skipping system Node.js check; install.sh provides the managed Node.js runtime"
+    assert_contains "$layered_log" "All dependencies installed"
+    assert_not_contains "$layered_log" "Node.js 20+ with npm and npx is required"
+
+    PATH="$fake_bin:/usr/bin:/bin" \
+    OS_RELEASE_FILE="$os_release" \
+    OSTREE_BOOTED_FILE="$ostree_booted" \
+    CODEX_BOOTSTRAP_DRY_RUN=1 \
+    CODEX_BOOTSTRAP_NONINTERACTIVE=1 \
+    CODEX_LINUX_FEATURES_ROOT="$REPO_DIR/linux-features" \
+    CODEX_LINUX_FEATURES_CONFIG="$workspace/features.json" \
+        bash "$REPO_DIR/scripts/bootstrap-wizard.sh" >"$wizard_log"
+    assert_contains "$wizard_log" "Package manager: rpm-ostree"
+    assert_contains "$wizard_log" "Native package format: rpm"
+    assert_contains "$wizard_log" "Atomic host: yes"
+
+    CODEX_LINUX_TARGET_ATOMIC=maybe \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    OS_RELEASE_FILE="$os_release" \
+    OSTREE_BOOTED_FILE="$ostree_booted" \
+    bash -c '
+        # shellcheck disable=SC1091
+        source "$1"
+        OS_RELEASE_ID="$(os_release_field ID)"
+        OS_RELEASE_ID_LIKE="$(os_release_field ID_LIKE 2>/dev/null || true)"
+        OS_RELEASE_VERSION_ID="$(os_release_field VERSION_ID)"
+        printf "manager=%s\natomic=%s\n" \
+            "$(detect_package_manager)" \
+            "$(linux_target_is_atomic && echo yes || echo no)"
+    ' _ "$REPO_DIR/scripts/lib/linux-target-detect.sh" >"$helper_output"
+    assert_contains "$helper_output" "manager=rpm-ostree"
+    assert_contains "$helper_output" "atomic=yes"
+
+    CODEX_LINUX_TARGET_ATOMIC=0 \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    OS_RELEASE_FILE="$os_release" \
+    OSTREE_BOOTED_FILE="$ostree_booted" \
+    bash -c '
+        # shellcheck disable=SC1091
+        source "$1"
+        OS_RELEASE_ID="$(os_release_field ID)"
+        OS_RELEASE_ID_LIKE="$(os_release_field ID_LIKE 2>/dev/null || true)"
+        OS_RELEASE_VERSION_ID="$(os_release_field VERSION_ID)"
+        printf "manager=%s\natomic=%s\n" \
+            "$(detect_package_manager)" \
+            "$(linux_target_is_atomic && echo yes || echo no)"
+    ' _ "$REPO_DIR/scripts/lib/linux-target-detect.sh" >"$helper_output"
+    assert_contains "$helper_output" "manager=unknown"
+    assert_contains "$helper_output" "atomic=no"
+
+    rm -f "$ostree_booted"
+    PATH="$fake_bin:/usr/bin:/bin" \
+    OS_RELEASE_FILE="$os_release" \
+    OSTREE_BOOTED_FILE="$ostree_booted" \
+    bash -c '
+        # shellcheck disable=SC1091
+        source "$1"
+        OS_RELEASE_ID="$(os_release_field ID)"
+        OS_RELEASE_ID_LIKE="$(os_release_field ID_LIKE 2>/dev/null || true)"
+        OS_RELEASE_VERSION_ID="$(os_release_field VERSION_ID)"
+        printf "manager=%s\nformat=%s\natomic=%s\n" \
+            "$(detect_package_manager)" \
+            "$(detect_package_format)" \
+            "$(linux_target_is_atomic && echo yes || echo no)"
+    ' _ "$REPO_DIR/scripts/lib/linux-target-detect.sh" >"$helper_output"
+    assert_contains "$helper_output" "manager=unknown"
+    assert_contains "$helper_output" "format=rpm"
+    assert_contains "$helper_output" "atomic=no"
 }
 
 test_setup_native_wizard_noninteractive_feature_writer() {
@@ -3110,6 +3338,7 @@ SCRIPT
 
     assert_file_exists "$workspace/work/.v8-nullptr-fix.h"
     assert_file_exists "$workspace/work/.cxx-v8-nullptr"
+    assert_contains "$workspace/work/.cxx-v8-nullptr" "#!/usr/bin/env bash"
     assert_contains "$workspace/work/.v8-nullptr-fix.h" "using std::nullptr_t;"
     assert_contains "$cxx_state" "CXX=$workspace/work/.cxx-v8-nullptr"
     assert_contains "$cxx_log" "-include"
@@ -3354,6 +3583,8 @@ test_launcher_template_sanity() {
     assert_contains "$REPO_DIR/launcher/start.sh.template" "ADOPTED_WEBVIEW_PID"
     assert_contains "$REPO_DIR/launcher/start.sh.template" "Reusing webview server pid="
     assert_contains "$REPO_DIR/launcher/start.sh.template" "run_cold_start_hooks"
+    assert_contains "$REPO_DIR/launcher/start.sh.template" '2>/dev/null 1>&"\$LAUNCHER_EARLY_STDERR_FD" || true'
+    assert_not_contains "$REPO_DIR/launcher/start.sh.template" '>&"\$LAUNCHER_EARLY_STDERR_FD" 2>/dev/null || true'
     assert_contains "$REPO_DIR/linux-features/remote-mobile-control/feature.json" '"stageHook": "./stage.sh"'
     assert_contains "$REPO_DIR/linux-features/remote-mobile-control/stage.sh" "cold-start.d"
     assert_contains "$REPO_DIR/linux-features/remote-mobile-control/stage.sh" "remote-mobile-control"
@@ -3918,8 +4149,10 @@ EOF
     assert_contains "$REPO_DIR/scripts/lib/package-common.sh" "node-runtime"
     assert_contains "$REPO_DIR/tests/fixtures/create-packaged-app-fixture.sh" "resources/node-runtime/bin"
     assert_contains "$REPO_DIR/.github/workflows/ci.yml" "tests/fixtures/create-packaged-app-fixture.sh codex-app"
-    assert_contains "$REPO_DIR/.github/workflows/ci.yml" "for file in scripts/patches/"
-    assert_contains "$REPO_DIR/scripts/ci/container-entrypoint.sh" "for file in scripts/patches/"
+    assert_contains "$REPO_DIR/.github/workflows/ci.yml" "bash scripts/ci/run-node-checks.sh"
+    assert_contains "$REPO_DIR/scripts/ci/container-entrypoint.sh" "bash scripts/ci/run-node-checks.sh"
+    assert_contains "$REPO_DIR/scripts/ci/run-node-checks.sh" "git ls-files '\\*.js'"
+    assert_contains "$REPO_DIR/scripts/ci/run-node-checks.sh" "git ls-files '\\*.test.js' 'linux-features/\\*/test.js'"
     assert_contains "$REPO_DIR/flake.nix" "rewriteCratesIoDownloadUrl"
     assert_contains "$REPO_DIR/flake.nix" "https://static.crates.io/crates/"
     assert_contains "$REPO_DIR/flake.nix" "api/v1/crates/"
@@ -3992,6 +4225,113 @@ if (!launcher.includes('ln -sfnT "$target" "$link_path"')) {
   throw new Error("replace_symlink must replace plugin links as paths, not as directory children");
 }
 NODE
+}
+
+test_webview_server_cache_policy() {
+    info "Checking webview server cache policy"
+    python3 - "$REPO_DIR/launcher/webview-server.py" <<'PY'
+import http.client
+import os
+import pathlib
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+
+server_path = pathlib.Path(sys.argv[1])
+workspace = pathlib.Path(tempfile.mkdtemp(prefix="codex-webview-cache-policy-"))
+proc = None
+
+try:
+    (workspace / "assets").mkdir()
+    (workspace / "apps").mkdir()
+    (workspace / "index.html").write_text("<!doctype html><title>Codex</title>", encoding="utf8")
+    (workspace / "assets" / "app-test-abc123.js").write_text("export default 1;\n", encoding="utf8")
+    (workspace / "apps" / "icon.png").write_bytes(b"png")
+    fixed_mtime = 1_700_000_000
+    for path in workspace.rglob("*"):
+        if path.is_file():
+            os.utime(path, (fixed_mtime, fixed_mtime))
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+
+    proc = subprocess.Popen(
+        [sys.executable, str(server_path), str(port), "--bind", "127.0.0.1"],
+        cwd=workspace,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+
+    deadline = time.time() + 5
+    while True:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                break
+        except OSError:
+            if proc.poll() is not None:
+                raise AssertionError(f"webview server exited early with {proc.returncode}")
+            if time.time() > deadline:
+                raise AssertionError("webview server did not start")
+            time.sleep(0.05)
+
+    def request(method, path, headers=None):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request(method, path, headers=headers or {})
+        response = conn.getresponse()
+        body = response.read()
+        result = (response.status, {k.lower(): v for k, v in response.getheaders()}, body)
+        conn.close()
+        return result
+
+    index_status, index_headers, _ = request("HEAD", "/index.html")
+    assert index_status == 200, index_status
+    assert index_headers.get("cache-control") == "no-store, max-age=0", index_headers
+    assert index_headers.get("pragma") == "no-cache", index_headers
+    assert index_headers.get("expires") == "0", index_headers
+
+    asset_status, asset_headers, _ = request("HEAD", "/assets/app-test-abc123.js")
+    assert asset_status == 200, asset_status
+    assert asset_headers.get("cache-control") == "public, max-age=31536000, immutable", asset_headers
+    assert "pragma" not in asset_headers, asset_headers
+    assert "expires" not in asset_headers, asset_headers
+
+    cached_status, cached_headers, _ = request(
+        "GET",
+        "/assets/app-test-abc123.js",
+        {"If-Modified-Since": asset_headers["last-modified"]},
+    )
+    assert cached_status == 304, (cached_status, cached_headers)
+    assert cached_headers.get("cache-control") == "public, max-age=31536000, immutable", cached_headers
+
+    refreshed_index_status, _, _ = request(
+        "GET",
+        "/index.html",
+        {"If-Modified-Since": index_headers["last-modified"]},
+    )
+    assert refreshed_index_status == 200, refreshed_index_status
+
+    icon_status, icon_headers, _ = request("HEAD", "/apps/icon.png")
+    assert icon_status == 200, icon_status
+    assert icon_headers.get("cache-control") == "no-store, max-age=0", icon_headers
+
+    escaped_index_status, escaped_index_headers, _ = request("HEAD", "/assets/../index.html")
+    assert escaped_index_status == 200, escaped_index_status
+    assert escaped_index_headers.get("cache-control") == "no-store, max-age=0", escaped_index_headers
+finally:
+    if proc is not None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+    shutil.rmtree(workspace, ignore_errors=True)
+PY
 }
 
 test_process_detection_helper_cmdline_shapes() {
@@ -4680,7 +5020,7 @@ make_fake_extracted_asar() {
     printf 'export{s as t};\n' > "$root/webview/assets/chunk-test.js"
     printf 'import{t as e}from"./chunk-test.js";Symbol.for(`react.transitional.element`);export{e as t};\n' > "$root/webview/assets/react-test.js"
     printf 'import{t as e}from"./chunk-test.js";Symbol.for(`react.transitional.element`);export{e as t};\n' > "$root/webview/assets/jsx-runtime-test.js"
-    printf 'let marker=`vscode://codex`;async function n(){return{}}export{n};\n' > "$root/webview/assets/vscode-api-test.js"
+    printf 'async function send(e,t,n,r,i){return fetch(`vscode://codex/${e}`)}function request(...e){let[t,n]=e,{params:r,select:i,signal:a,source:o}=n??{};return send(t,r,i,a,o)}export{request as l};\n' > "$root/webview/assets/setting-storage-test.js"
     cat > "$root/webview/assets/app-server-manager-signals-test.js" <<'JS'
 function j(e){return e}function B(e){if(e==null||typeof e==`string`)return null;let t=Mi(e);return t==null?null:Ni(t)}function Mi(e){return`subAgent`in e?e.subAgent:null}function Ni(e){return typeof e==`string`?Pi():`thread_spawn`in e?{parentThreadId:j(e.thread_spawn.parent_thread_id),depth:e.thread_spawn.depth,agentNickname:e.thread_spawn.agent_nickname,agentRole:e.thread_spawn.agent_role}:Pi()}function Pi(){return{parentThreadId:null,depth:null,agentNickname:null,agentRole:null}}function Xl(e){return e==null?null:Zl(e.agentNickname)??Zl(B(e.source)?.agentNickname)}function Zl(e){if(e==null)return null;let t=e.trim();return t.length===0?null:t}
 JS
@@ -4903,7 +5243,7 @@ if (!result.event.prevented || result.state.hideCalls !== 1) {
 NODE
 
     node "$REPO_DIR/scripts/patch-linux-window-ui.js" "$extracted" >"$output_log" 2>&1
-    assert_occurrence_count "$extracted/.vite/build/main-test.js" 'process.platform!==`linux`' '1'
+    assert_occurrence_count "$extracted/.vite/build/main-test.js" 'process.platform!==`win32`&&process.platform!==`darwin`&&process.platform!==`linux`?null:' '1'
     assert_occurrence_count "$extracted/.vite/build/main-test.js" 'nativeImage.createFromPath(process.resourcesPath' '3'
     assert_occurrence_count "$extracted/.vite/build/main-test.js" 'nativeImage.createFromPath(process.resourcesPath+`/../.codex-linux/codex-desktop-tray.png`)' '1'
     assert_occurrence_count "$extracted/.vite/build/main-test.js" 'nativeImage.createFromPath(process.resourcesPath+`/../.codex-linux/codex-desktop.png`)' '1'
@@ -5674,17 +6014,19 @@ test_linux_computer_use_gate_patch_smoke() {
     bundle_body="$(cat <<'JS'
 let n={app:{whenReady(){},quit(){},requestSingleInstanceLock(){},on(){},off(){}}};
 let Qt=`openai-bundled`,$t=`browser-use`,en=`chrome-internal`,tn=`computer-use`,nn=`latex-tectonic`;
-var $n=[{forceReload:!0,installWhenMissing:!0,name:$t,isEnabled:({features:e})=>e.browserAgentAvailable,migrate:cn},{name:en,isEnabled:({buildFlavor:e})=>rn(e)},{name:tn,isEnabled:({features:e,platform:t})=>t===`darwin`&&e.computerUse,migrate:wn},{name:nn,isEnabled:()=>!0}];
+function cl(e){if(!(e.platform!==`darwin`||!e.marketplacePluginNames.includes(`computer-use`)))return e.desktopFeatureAvailability.computerUseNodeRepl?`node-repl`:`legacy-mcp`}
+var $n=[{forceReload:!0,installWhenMissing:!0,name:$t,isEnabled:({features:e})=>e.browserAgentAvailable,migrate:cn},{name:en,isEnabled:({buildFlavor:e})=>rn(e)},{name:tn,isEnabled:cl,migrate:wn},{name:nn,isEnabled:()=>!0}];
 JS
 )"
     make_fake_extracted_asar "$extracted" "$bundle_body"
 
     node "$REPO_DIR/scripts/patch-linux-window-ui.js" "$extracted" >"$output_log" 2>&1
-    assert_contains "$extracted/.vite/build/main-test.js" '(t===`darwin`||t===`linux`)&&e.computerUse'
-    assert_not_contains "$extracted/.vite/build/main-test.js" 't===`darwin`&&e.computerUse'
+    assert_contains "$extracted/.vite/build/main-test.js" 'if(!((e.platform!==`darwin`&&e.platform!==`linux`)||!e.marketplacePluginNames.includes(`computer-use`))'
+    assert_contains "$extracted/.vite/build/main-test.js" 'return e.platform===`darwin`&&e.desktopFeatureAvailability.computerUseNodeRepl?`node-repl`:`legacy-mcp`'
+    assert_not_contains "$extracted/.vite/build/main-test.js" 'if(!(e.platform!==`darwin`||!e.marketplacePluginNames.includes(`computer-use`)))return e.desktopFeatureAvailability.computerUseNodeRepl?`node-repl`:`legacy-mcp`'
 
     node "$REPO_DIR/scripts/patch-linux-window-ui.js" "$extracted" >"$output_log" 2>&1
-    assert_occurrence_count "$extracted/.vite/build/main-test.js" '(t===`darwin`||t===`linux`)&&e.computerUse' '1'
+    assert_occurrence_count "$extracted/.vite/build/main-test.js" 'return e.platform===`darwin`&&e.desktopFeatureAvailability.computerUseNodeRepl?`node-repl`:`legacy-mcp`' '1'
 }
 
 test_linux_computer_use_ui_opt_in_smoke() {
@@ -5710,7 +6052,8 @@ test_linux_computer_use_ui_opt_in_smoke() {
 let n={app:{whenReady(){},quit(){},requestSingleInstanceLock(){},on(){},off(){}}};
 let cp=require(`node:child_process`),fs=require(`node:fs`),p=require(`node:path`),os=require(`node:os`);
 let Qt=`openai-bundled`,$t=`browser-use`,en=`chrome-internal`,tn=`computer-use`,nn=`latex-tectonic`;
-var $n=[{name:tn,isEnabled:({features:e,platform:t})=>t===`darwin`&&e.computerUse,migrate:wn}];
+function cl(e){if(!(e.platform!==`darwin`||!e.marketplacePluginNames.includes(`computer-use`)))return e.desktopFeatureAvailability.computerUseNodeRepl?`node-repl`:`legacy-mcp`}
+var $n=[{name:tn,isEnabled:cl,migrate:wn}];
 function me(e,{env:t=process.env,platform:n=process.platform}={}){return n!==`win32`||t.CODEX_ELECTRON_ENABLE_WINDOWS_COMPUTER_USE!==`1`?e:{...e,computerUse:!0,computerUseNodeRepl:!0}}
 var h={handlers:{"native-desktop-apps":async()=>({apps:[]})}};
 JS
@@ -5747,7 +6090,9 @@ JS
         env -u CODEX_LINUX_ENABLE_COMPUTER_USE_UI -u CODEX_LINUX_APP_ID -u CODEX_APP_ID -u CODEX_LINUX_SETTINGS_FILE \
         HOME="$fake_home" XDG_CONFIG_HOME="$fake_home/.config" \
         node "$REPO_DIR/scripts/patch-linux-window-ui.js" "$extracted" >"$output_log" 2>&1
-    assert_contains "$main_bundle" '(t===`darwin`||t===`linux`)&&e.computerUse'
+    assert_contains "$main_bundle" 'if(!((e.platform!==`darwin`&&e.platform!==`linux`)||!e.marketplacePluginNames.includes(`computer-use`))'
+    assert_contains "$main_bundle" 'return e.platform===`darwin`&&e.desktopFeatureAvailability.computerUseNodeRepl?`node-repl`:`legacy-mcp`'
+    assert_not_contains "$main_bundle" 'if(!(e.platform!==`darwin`||!e.marketplacePluginNames.includes(`computer-use`)))return e.desktopFeatureAvailability.computerUseNodeRepl?`node-repl`:`legacy-mcp`'
     assert_not_contains "$main_bundle" 'return n===`linux`?{...e,computerUse:!0,computerUseNodeRepl:!0}'
     assert_not_contains "$main_bundle" 'codexLinuxNativeDesktopApps'
     assert_not_contains "$renderer_asset" 'function hae(e){return e===`macOS`||e===`windows`||e===`linux`}'
@@ -5766,7 +6111,8 @@ JS
     env -u CODEX_LINUX_APP_ID -u CODEX_APP_ID -u CODEX_LINUX_SETTINGS_FILE \
         CODEX_LINUX_ENABLE_COMPUTER_USE_UI=1 HOME="$fake_home" XDG_CONFIG_HOME="$fake_home/.config" \
         node "$REPO_DIR/scripts/patch-linux-window-ui.js" "$extracted" >"$output_log" 2>&1
-    assert_contains "$main_bundle" '(t===`darwin`||t===`linux`)&&e.computerUse'
+    assert_contains "$main_bundle" 'if(!((e.platform!==`darwin`&&e.platform!==`linux`)||!e.marketplacePluginNames.includes(`computer-use`))'
+    assert_contains "$main_bundle" 'return e.platform===`darwin`&&e.desktopFeatureAvailability.computerUseNodeRepl?`node-repl`:`legacy-mcp`'
     assert_contains "$main_bundle" 'return n===`linux`?{...e,computerUse:!0,computerUseNodeRepl:!0}'
     assert_contains "$main_bundle" 'codexLinuxNativeDesktopApps'
     assert_contains "$main_bundle" '"computer-use-native-desktop-app-icon":async(e)=>process.platform===`linux`?codexLinuxNativeDesktopAppIcon(e):{iconSmall:``}'
@@ -6646,10 +6992,12 @@ main() {
     test_installer_refreshes_stale_cached_dmg_metadata
     test_extract_dmg_repairs_safe_7z_link_warnings
     test_fresh_install_removes_cached_dmg_metadata
+    test_fresh_pinned_dmg_preserves_cached_dmg_metadata
     test_fresh_reuse_dmg_uses_cache_when_metadata_matches
     test_rebuild_candidate_uses_validated_default_dmg
     test_native_shortcut_targets_compose_existing_flows
     test_fedora_dependency_bootstrap_installs_rpmbuild
+    test_fedora_atomic_rpm_ostree_target_detection
     test_setup_native_wizard_noninteractive_feature_writer
     test_setup_native_wizard_rejects_invalid_feature_ids
     test_setup_native_wizard_rejects_features_without_readme
@@ -6697,6 +7045,7 @@ main() {
     test_chrome_marketplace_fallback_synthesis
     test_chrome_native_host_manifest_writer
     test_launcher_template_sanity
+    test_webview_server_cache_policy
     test_process_detection_helper_cmdline_shapes
     test_webview_probe_equivalence
     test_side_by_side_launcher_identity
